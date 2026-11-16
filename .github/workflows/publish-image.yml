@@ -1,0 +1,85 @@
+name: Publish image
+
+on:
+  # manual, and also dispatched by the CI of gdal-oci after it publishes new
+  # ndscprm/gdal images, with their full names.
+  # There is no scheduled rebuild: a new base image invalidates every layer, so
+  # apt and pip fetch the current packages on that build
+  workflow_dispatch:
+    # full names of the ndscprm/gdal images to build on (the CI of gdal-oci sends the dated tags it has just
+    # published, pinned by digest: <tag>-<YYYYMMDD>@sha256:...). Every derived image declares the same
+    # three inputs, so gdal-oci sends the same set to all of them; each uses those its Dockerfile needs.
+    # Empty = the ARG default of the Dockerfile (a moving tag)
+    inputs:
+      image_devel:
+        description: ndscprm/gdal devel image (GDAL_IMAGE_DEVEL). Empty = Dockerfile default
+        required: false
+        default: ""
+      image_py:
+        description: ndscprm/gdal image with Python (GDAL_IMAGE_PY). Empty = Dockerfile default
+        required: false
+        default: ""
+      image_nopy:
+        description: ndscprm/gdal image without Python (GDAL_IMAGE_NOPY). Empty = Dockerfile default
+        required: false
+        default: ""
+  # pull_request:
+
+permissions:
+  contents: read
+
+# one build at a time (e.g. a manual run and one started by gdal-oci), so they never
+# push the same tags in parallel; a running build is never cancelled
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  # the inputs must name ndscprm/gdal images: a manual run could otherwise build on any image
+  check:
+    runs-on: ubuntu-24.04
+    permissions: {}
+    steps:
+      - env:
+          IMAGES: ${{ inputs.image_devel }} ${{ inputs.image_py }} ${{ inputs.image_nopy }}
+        run: |
+          for image in $IMAGES; do
+              case $image in
+                  docker.io/ndscprm/gdal:*) echo "base image: $image" ;;
+                  *)
+                      echo "::error::not a docker.io/ndscprm/gdal image: $image"
+                      exit 1
+                      ;;
+              esac
+          done
+
+  # build, test, scan and tags in the reusable workflow of the base image (README
+  # of gdal-oci, "Workflow reutilizável"): native runners per architecture, push
+  # by digest, tags only after the tests and scans of both architectures
+  image:
+    needs: check
+    uses: nds-cprm/gdal-oci/.github/workflows/reusable-publish-image.yml@main
+    permissions:
+      contents: read
+      # upload of the SARIF reports to code scanning
+      security-events: write
+    secrets:
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+    with:
+      image: docker.io/ndscprm/geonode-base
+      # the Dockerfile (ARG GEONODE_VERSION) is the single source of the
+      # GeoNode version this base is made for, and of the image tag
+      version-arg: GEONODE_VERSION
+      # base images given by gdal-oci when it starts this workflow (the images it has just published);
+      # empty lines are ignored, so without them the ARG defaults of the Dockerfile are built.
+      # image_nopy is accepted and ignored: this image needs Python
+      build-args: |
+        ${{ inputs.image_devel && format('GDAL_IMAGE_DEVEL={0}', inputs.image_devel) || '' }}
+        ${{ inputs.image_py && format('GDAL_IMAGE_PY={0}', inputs.image_py) || '' }}
+      # the OCI labels come from the Dockerfile; created, revision and source from the reusable workflow
+      variants: |
+        [
+          {"name": "release", "target": "release", "tag": "{version}", "scan": true,
+           "test": "sh .github/scripts/smoke-test.sh \"$IMAGE_REF\""}
+        ]

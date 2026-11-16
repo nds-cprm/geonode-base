@@ -10,9 +10,16 @@
 #   - system python3-* and uwsgi packages are dropped: everything Python goes into the venv
 #   - multi-stage: packages that need a compiler are built as wheels on the GDAL devel image
 #     (same Debian, Python and /opt/geosgb layout), so the final image has no compilers or headers
-ARG GDAL_IMAGE=docker.io/ndscprm/gdal
-# release tag; the builder uses "${GDAL_TAG}-devel"
-ARG GDAL_TAG=3.12.4-py3.12
+
+# base images: ndscprm/gdal (Debian trixie + official Python + GDAL in /opt/geosgb), by full name. The defaults
+# are the moving tags, rebuilt in place every week, for local builds; the CI passes the exact images the CI of
+# gdal-oci has just published (dated tag and digest: <tag>-<YYYYMMDD>@sha256:...), all of the same build of the base
+ARG GDAL_IMAGE_DEVEL=docker.io/ndscprm/gdal:3.12.4-py3.12-devel
+ARG GDAL_IMAGE_PY=docker.io/ndscprm/gdal:3.12.4-py3.12
+
+# GeoNode version this base is made for (the Python pins below follow its pyproject.toml); it is the image tag,
+# read by the CI workflow (keep this format: ARG GEONODE_VERSION=X.Y.Z)
+ARG GEONODE_VERSION=5.2.0
 
 # Python packages of the upstream base, plus psycopg2 (GeoNode requirement that needs libpq to build).
 # Keep UWSGI_VERSION and PSYCOPG2_VERSION equal to GeoNode's pyproject.toml pins: if they differ, pip tries
@@ -26,7 +33,7 @@ ARG SHERLOCK_VERSION=0.4.1
 ARG NUMPY_VERSION=1.26.*
 
 
-FROM ${GDAL_IMAGE}:${GDAL_TAG}-devel AS builder
+FROM ${GDAL_IMAGE_DEVEL} AS build
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
@@ -67,7 +74,7 @@ RUN pip install --no-cache-dir --no-index --find-links /wheels \
     cat /tmp/runtime-packages.txt
 
 
-FROM ${GDAL_IMAGE}:${GDAL_TAG}
+FROM ${GDAL_IMAGE_PY} AS release
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
@@ -96,13 +103,13 @@ ARG NUMPY_VERSION
 #         "${PG_CLIENT_VERSION}" > /etc/apt/preferences.d/pgdg && \
 #     rm -rf /var/lib/apt/lists/*
 
-# Runtime libraries of the wheels built in the builder, and the tools the upstream base ships.
+# Runtime libraries of the wheels built in the build stage, and the tools the upstream base ships.
 # libmagic1: loaded via ctypes by python-magic (GeoNode's FileValidationUploadHandler, every file upload);
 # upstream gets it indirectly through libgdal-dev, which is not installed here.
 # procps, file, less: troubleshooting only (GeoNode does not call them). procps gives ps/top/pkill/free to inspect
 # uWSGI and Celery processes; file reads upload types with the same libmagic as python-magic; less for logs.
 # Upstream has them via its -dev packages. Safe to drop for a slimmer image
-RUN --mount=type=bind,from=builder,source=/tmp/runtime-packages.txt,target=/tmp/runtime-packages.txt \
+RUN --mount=type=bind,from=build,source=/tmp/runtime-packages.txt,target=/tmp/runtime-packages.txt \
     apt-get update -y && \
     xargs -a /tmp/runtime-packages.txt \
         apt-get install -y --no-install-recommends && \
@@ -119,11 +126,11 @@ RUN --mount=type=bind,from=builder,source=/tmp/runtime-packages.txt,target=/tmp/
     # root (derived image builds) does not need them. Packages installed later in derived images may add them back
     find / -xdev -type f -perm /6000 -exec chmod a-s {} +
 
-# Python packages, from the builder's wheels only (no compiler here).
+# Python packages, from the build stage's wheels only (no compiler here).
 # GDAL is not installed: the bindings in the venv are built against the GDAL in /opt/geosgb.
 # pyarrow is removed: it needs numpy >= 2 and is not used; Arrow/Parquet stay available through GDAL's
 # drivers, which use the Arrow C++ libraries in /opt/geosgb/lib, not pyarrow
-RUN --mount=type=bind,from=builder,source=/wheels,target=/wheels \
+RUN --mount=type=bind,from=build,source=/wheels,target=/wheels \
     pip uninstall -y pyarrow && \
     pip install --no-cache-dir --no-index --find-links /wheels \
         "uWSGI==${UWSGI_VERSION}" \
@@ -148,11 +155,22 @@ RUN --mount=type=bind,from=builder,source=/wheels,target=/wheels \
 
 WORKDIR /usr/src/geonode
 
-ARG GDAL_TAG
+COPY LICENSE /usr/share/doc/geonode-base/
+
+# the base this image was built on: its tags (<version>, and the dated one) do not say
+ARG GDAL_IMAGE_PY
+ARG GEONODE_VERSION
+# every key, or the labels of the ndscprm/gdal base would show through; created and revision are set by the CI,
+# for each build
 LABEL org.opencontainers.image.title="GeoNode base" \
-      org.opencontainers.image.description="Imagem base do GeoNode para instâncias do SGB, derivada de ndscprm/gdal:${GDAL_TAG}" \
+      org.opencontainers.image.description="Imagem base do GeoNode para instâncias do SGB, sobre GDAL e Python" \
+      org.opencontainers.image.version="${GEONODE_VERSION}" \
       org.opencontainers.image.vendor="SGB/CPRM" \
+      org.opencontainers.image.authors="Carlos Eduardo Mota <carlos.mota@sgb.gov.br>" \
       org.opencontainers.image.licenses="GPL-3.0" \
-      org.opencontainers.image.base.name="docker.io/ndscprm/gdal:${GDAL_TAG}"
+      org.opencontainers.image.url="https://hub.docker.com/r/ndscprm/geonode-base" \
+      org.opencontainers.image.documentation="https://github.com/nds-cprm/geonode-base#readme" \
+      org.opencontainers.image.source="https://github.com/nds-cprm/geonode-base" \
+      org.opencontainers.image.base.name="${GDAL_IMAGE_PY}"
 
 SHELL ["/bin/sh", "-c"]

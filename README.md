@@ -11,10 +11,13 @@ do GeoNode. Ela substitui `geonode/geonode-base` no `FROM` do `Dockerfile` do Ge
 ## Build
 
 ```sh
-docker build -t geonode-base:3.12.4 .
+docker build -t geonode-base:local .
 
-# outra tag da imagem do GDAL
-docker build --build-arg GDAL_TAG=3.12.4-py3.12 -t geonode-base:3.12.4 .
+# sobre um build fixo da imagem base (tag datada, opcionalmente com o digest), como no CI:
+docker build \
+    --build-arg GDAL_IMAGE_DEVEL=docker.io/ndscprm/gdal:3.12.4-py3.12-devel-20261026 \
+    --build-arg GDAL_IMAGE_PY=docker.io/ndscprm/gdal:3.12.4-py3.12-20261026 \
+    -t geonode-base:local .
 ```
 
 O build precisa do BuildKit (padrão no Docker atual), por causa do `RUN --mount`.
@@ -23,23 +26,90 @@ Argumentos:
 
 | Argumento          | Padrão                   | Uso                                                              |
 |--------------------|--------------------------|------------------------------------------------------------------|
-| `GDAL_IMAGE`       | `docker.io/ndscprm/gdal` | repositório da imagem do GDAL                                    |
-| `GDAL_TAG`         | `3.12.4-py3.12`          | tag da imagem final (variante `-py`). O builder usa `${GDAL_TAG}-devel` |
+| `GDAL_IMAGE_DEVEL` | `docker.io/ndscprm/gdal:3.12.4-py3.12-devel` | imagem do estágio `build`, pelo nome completo |
+| `GDAL_IMAGE_PY`    | `docker.io/ndscprm/gdal:3.12.4-py3.12` | imagem do estágio `release`, pelo nome completo. Vai para o label `org.opencontainers.image.base.name` |
+| `GEONODE_VERSION`  | `5.2.0`                  | versão do GeoNode para a qual a base é feita. É a tag da imagem e o label `org.opencontainers.image.version` |
 | `UWSGI_VERSION`    | `2.0.30`                 | uWSGI, igual ao pin do GeoNode                                   |
 | `PSYCOPG2_VERSION` | `2.9.13`                 | psycopg2, igual ao pin do GeoNode                                |
 | `INVOKE_VERSION`   | `2.2.0`                  | invoke                                                           |
 | `SHERLOCK_VERSION` | `0.4.1`                  | sherlock                                                         |
 | `NUMPY_VERSION`    | `1.26.*`                 | numpy, igual ao pin do GeoNode                                   |
 
+## CI e publicação
+
+A imagem é publicada como [`ndscprm/geonode-base`](https://hub.docker.com/r/ndscprm/geonode-base), com o mesmo
+fluxo da [mapproxy-oci](https://github.com/nds-cprm/mapproxy-oci). O workflow
+[`publish-image.yml`](.github/workflows/publish-image.yml) chama o
+[workflow reutilizável do gdal-oci](https://github.com/nds-cprm/gdal-oci#workflow-reutilizável). Ele:
+
+1. constrói as imagens `amd64` e `arm64` em runners nativos e publica cada uma só por digest, com attestations de
+   SBOM e de provenance;
+2. roda o teste de fumaça [`.github/scripts/smoke-test.sh`](.github/scripts/smoke-test.sh) em cada arquitetura;
+3. analisa CVEs com o Trivy e o Grype e envia os relatórios para a aba *Security*;
+4. só então cria as tags.
+
+Uma falha no teste ou na análise impede a criação das tags. As vulnerabilidades só são reportadas, não bloqueiam.
+
+| Tag | Exemplo | Conteúdo |
+|---|---|---|
+| `<versão do GeoNode>` | `5.2.0` | **Móvel**: republicada a cada rebuild da imagem base, com as correções de segurança. Recomendada no `FROM` |
+| `<versão>-<AAAAMMDD>` | `5.2.0-20261116` | Um build específico (data UTC; `.2`, `.3`... nos builds seguintes do mesmo dia). Nunca é sobrescrita: use-a, de preferência com o digest, para fixar a imagem ou voltar a uma anterior |
+
+Não há tag `latest`. A base exata de cada build fica no label `org.opencontainers.image.base.name`.
+
+**Disparo:**
+
+- **Manual**, pela aba *Actions*, com as entradas opcionais `image_devel` e `image_py`: nomes completos das imagens
+  `ndscprm/gdal`. Vazias, valem os padrões do Dockerfile. O job `check` recusa qualquer imagem fora de
+  `docker.io/ndscprm/gdal:`. A entrada `image_nopy` é aceita e ignorada: o gdal-oci manda as mesmas três entradas
+  para todas as imagens derivadas.
+- **Pelo CI do gdal-oci**, depois que ele publica a `ndscprm/gdal` (toda semana), com as tags datadas e o digest
+  das imagens que acabou de publicar. Não há build agendado próprio: uma base nova invalida todas as camadas, e o
+  apt e o pip pegam os pacotes atuais.
+
+**Configuração necessária:**
+
+- **Neste repositório:** os secrets `DOCKERHUB_USERNAME` e `DOCKERHUB_TOKEN`, com permissão de push em
+  `ndscprm/geonode-base`. O repositório precisa existir no Docker Hub.
+- **No gdal-oci:**
+  - acrescentar `geonode-base` na matriz `repository` do job `dispatch` do `publish-image.yml`;
+  - dar à GitHub App (`DERIVED_IMAGES_APP_CLIENT_ID`) acesso a este repositório.
+
+  Sem isso, o build semanal da base não dispara este workflow, e a imagem só é atualizada manualmente.
+
+**Versão.** A tag vem da linha `ARG GEONODE_VERSION=X.Y.Z` do [Dockerfile](Dockerfile), que o workflow lê com
+`sed`. Mantenha esse formato. Ao passar para outra versão do GeoNode:
+
+1. atualize `GEONODE_VERSION`;
+2. alinhe `UWSGI_VERSION`, `PSYCOPG2_VERSION` e `NUMPY_VERSION` ao `pyproject.toml` daquela versão;
+3. confira o pin do GDAL (veja [Atenção: versão do GDAL no GeoNode](#atenção-versão-do-gdal-no-geonode));
+4. faça o commit e dispare o workflow.
+
+**Teste de fumaça.** Roda o container como as imagens derivadas rodam em produção:
+`--user 12345:0 --read-only --tmpfs /tmp --cap-drop ALL`. Ele confere:
+
+- a configuração da imagem: sem `USER`, `WORKDIR` e `ENTRYPOINT`;
+- o nss_wrapper (usuário `sgb`, `HOME=/tmp`);
+- `/usr/src/venv`, `invoke` e `uwsgi`;
+- `pip check`;
+- os bindings do GDAL iguais à biblioteca, com numpy 1.x, sem pyarrow, e com os drivers usados pelo GeoNode;
+- o psycopg2 ligado à `libpq` do sistema, e o `psql` com a mesma versão major da `libpq`;
+- a `libmagic`;
+- o `ogr2ogr` gravando em `/tmp`, e nada fora dele gravável;
+- nenhum arquivo setuid/setgid e nenhum compilador.
+
+Para rodar localmente: `sh .github/scripts/smoke-test.sh <imagem>` (com Podman:
+`DOCKER=podman sh .github/scripts/smoke-test.sh <imagem>`).
+
 ## Multi-stage
 
 | Estágio   | Imagem                         | Função                                                                 |
 |-----------|--------------------------------|------------------------------------------------------------------------|
-| `builder` | `ndscprm/gdal:${GDAL_TAG}-devel` | compila as wheels (uWSGI, psycopg2 e as demais) e lista as bibliotecas Debian que os binários usam (`ldd` + `dpkg -S`) |
-| final     | `ndscprm/gdal:${GDAL_TAG}`     | instala só essas bibliotecas e as wheels, sem compiladores nem headers |
+| `build`   | `GDAL_IMAGE_DEVEL`             | compila as wheels (uWSGI, psycopg2 e as demais) e lista as bibliotecas Debian que os binários usam (`ldd` + `dpkg -S`) |
+| `release` | `GDAL_IMAGE_PY`                | instala só essas bibliotecas e as wheels, sem compiladores nem headers |
 
 As duas imagens têm o mesmo Debian, o mesmo Python e o mesmo `/opt/geosgb`, por isso as wheels compiladas no
-builder funcionam na imagem final.
+estágio `build` funcionam na imagem final.
 
 **Consequência para as imagens derivadas**: a imagem final não tem `gcc` nem pacotes `-dev`. O `pip install` do
 GeoNode funciona porque uWSGI e psycopg2 já estão instalados nas versões que ele fixa, e as demais dependências têm
@@ -56,8 +126,8 @@ Um geonode-project que dependa de outro pacote sem wheel precisa compilar num es
   e o `pyarrow` é removido. Veja [numpy e pyarrow](#numpy-e-pyarrow).
   `/usr/src/venv` continua existindo como link simbólico para ele, e `/usr/local/bin/invoke` também é mantido.
 - **Pacotes `python3-*` e `uwsgi` do sistema**: não são instalados. uWSGI, invoke e sherlock vão para o venv via pip,
-  junto com o psycopg2, compilado no builder.
-- **Compiladores e headers** (`build-essential`, `gcc`, `libpq-dev`, `libxml2-dev` etc.): ficam só no builder.
+  junto com o psycopg2, compilado no estágio `build`.
+- **Compiladores e headers** (`build-essential`, `gcc`, `libpq-dev`, `libxml2-dev` etc.): ficam só no estágio `build`.
   Veja [Multi-stage](#multi-stage).
 - **Ferramentas de empacotamento Debian** (`devscripts`, `debhelper`, `pkg-kde-tools`): removidas, eram usadas só por
   um build do PROJ que está comentado no upstream.
@@ -142,7 +212,7 @@ Análise de 16/11/2026, com Trivy 0.76.1 (CVEs e segredos), Grype v0.121.0 (SBOM
 | Cache do pip | 29 MB em `/root/.cache` | `--no-cache-dir` |
 | Camadas | 16 | 12 |
 | Arquiteturas | amd64 | amd64 e arm64 |
-| Labels OCI | 4 (herdados do Ubuntu) | 12 |
+| Labels OCI | 4 (herdados do Ubuntu) | 12 (todas as chaves definidas no Dockerfile; `created` e `revision` vêm do CI) |
 | SBOM de componentes fora do apt | não | sim (`/opt/geosgb/share/sbom`) |
 | Usuário | root | root na base (o `USER` fica para a imagem final). Veja [Sem root, somente leitura](#execução-sem-root-e-com-filesystem-somente-leitura) |
 | UID arbitrário | sem suporte | nss_wrapper no entrypoint |
@@ -158,7 +228,7 @@ Observações:
 - **Usuário root e `HEALTHCHECK`**: numa imagem base, as duas coisas cabem à imagem do GeoNode ou ao compose.
   A base não define `USER`, porque o Dockerfile do GeoNode ainda roda `apt-get` depois do `FROM`.
 - **Hadolint, nossos avisos**: DL3008 (versões do apt sem pin; prática comum no Debian, para receber as correções de
-  segurança), DL3013 (`certifi` sem pin) e SC3011 (here-string no builder, que roda em bash; falso positivo).
+  segurança), DL3013 (`certifi` sem pin) e SC3011 (here-string no estágio `build`, que roda em bash; falso positivo).
 
 ### Melhorias possíveis
 
@@ -430,7 +500,7 @@ O `pyproject.toml` do GeoNode fixa `GDAL==3.12.2`, e a imagem traz os bindings d
 ```
 
 Com isso, o pip considera os bindings da imagem já instalados (`Requirement already satisfied: GDAL==3.12.4`) e
-não compila nada. O pin precisa acompanhar a versão do GDAL de `GDAL_TAG`. Ao trocar a tag, o `pyproject.toml`
+não compila nada. O pin precisa acompanhar a versão do GDAL de `GDAL_IMAGE_PY`. Ao trocar a imagem, o `pyproject.toml`
 também precisa mudar.
 
 Para testes rápidos, sem editar o `pyproject.toml`, dá para relaxar o pin no Dockerfile derivado, antes do
