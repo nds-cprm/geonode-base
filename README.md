@@ -146,7 +146,7 @@ Análise de 16/11/2026, com Trivy 0.76.1 (CVEs e segredos), Grype v0.121.0 (SBOM
 | SBOM de componentes fora do apt | não | sim (`/opt/geosgb/share/sbom`) |
 | Usuário | root | root na base (o `USER` fica para a imagem final). Veja [Sem root, somente leitura](#execução-sem-root-e-com-filesystem-somente-leitura) |
 | UID arbitrário | sem suporte | nss_wrapper no entrypoint |
-| Filesystem somente leitura | não testado | testado (`--read-only --tmpfs /tmp`) |
+| Filesystem somente leitura | não testado | testado (`--read-only`, com `/tmp` em tmpfs ou volume) |
 | `HEALTHCHECK` | não | não |
 | setuid/setgid | 14 | 0 (bits removidos) |
 
@@ -170,12 +170,13 @@ Observações:
 
 Objetivo: as imagens do GeoNode rodam com um UID não root e com o filesystem raiz somente leitura. O código em
 `/usr/src/geonode` e o venv continuam imutáveis, pertencentes ao root. Só os pontos de escrita são graváveis, e
-eles vêm de volumes ou tmpfs. Por isso a base **não** libera escrita em `/usr/src/geonode`.
+eles vêm de volumes (ou tmpfs). Por isso a base **não** libera escrita em `/usr/src/geonode`.
 
 ### O que a base já garante
 
 Testado com
-`podman run --read-only --tmpfs /tmp --user 12345:0 --security-opt no-new-privileges --cap-drop ALL`:
+`podman run --read-only --tmpfs /tmp --user 12345:0 --security-opt no-new-privileges --cap-drop ALL`, e também com
+um volume nomeado novo em `/tmp` (`-v tmp:/tmp`) no lugar do tmpfs, como no compose do GeoNode:
 
 - **nss_wrapper**: cria o usuário virtual `sgb` para o UID sem entrada no `/etc/passwd` (`USER_NAME` muda o nome),
   com `HOME=/tmp`. Os arquivos virtuais ficam em `$TMPDIR` (`/tmp`). No podman, para reproduzir o comportamento do
@@ -195,31 +196,51 @@ O GeoNode master (commit `c125d8f`) ainda assume root e escrita no filesystem ra
 | `entrypoint.sh`: `service cron restart` | exige root e aborta o entrypoint (`set -e`) | remover a linha. O GeoNode não instala crontab: as tarefas periódicas ficam no Celery beat |
 | `entrypoint.sh`: `source $HOME/.bashrc` | `HOME=/tmp` não tem `.bashrc`, e o `source` aborta o entrypoint | `[ -f "$HOME/.bashrc" ] && source "$HOME/.bashrc"` |
 | `entrypoint.sh`: `> /usr/src/geonode/invoke.log` | código somente leitura | `INVOKE_LOG_STDOUT=true` (log no stdout) |
-| `tasks.py`: `$HOME/.override_env` e `/tmp/*.json` | precisam de escrita | atendidos pelo tmpfs em `/tmp` (`HOME=/tmp`) |
+| `tasks.py`: `$HOME/.override_env` e `/tmp/*.json` | precisam de escrita | atendidos pelo volume `tmp` em `/tmp` (`HOME=/tmp`) |
 | `uwsgi.ini`: `logto = /var/log/geonode.log` | `/var/log` somente leitura | remover o `logto` (log no stdout) |
 | `celery-cmd`: `/var/log/celery.log`, `/var/log/celery_beat.log` | `/var/log` somente leitura | `CELERY__LOG_FILE` e `CELERY__BEAT_LOG` em `/dev/stdout`, ou num volume |
-| `celery-cmd`: `/tmp/celerybeat.pid` | precisa de escrita | atendido pelo tmpfs em `/tmp` |
+| `celery-cmd`: `/tmp/celerybeat.pid` | precisa de escrita | atendido pelo volume `tmp` em `/tmp` |
 | statics, uploads, `celerybeat-schedule`, `geonode_init.lock` | escrita em `/mnt/volumes/statics` | volume gravável pelo UID (ou pelo grupo 0) |
 | `Dockerfile` | — | `USER 1000:0` (numérico, para o `runAsNonRoot` do Kubernetes) no fim |
 
-Exemplo de compose:
+Exemplo de compose, sobre o `x-common-django` do GeoNode, que já monta os volumes (inclusive `tmp:/tmp`):
 
 ```yaml
-    user: "1000:0"
-    read_only: true
-    tmpfs:
-      - /tmp
-    security_opt:
-      - no-new-privileges:true
-    cap_drop:
-      - ALL
-    volumes:
-      - statics:/mnt/volumes/statics
+x-common-django:
+  &default-common-django
+  user: "1000:0"
+  read_only: true
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+  volumes:
+    - statics:/mnt/volumes/statics
+    - geoserver-data-dir:/geoserver_data/data
+    - backup-restore:/backup_restore
+    - data:/data
+    - tmp:/tmp
 ```
 
-O `tmpfs` em `/tmp` também cobre os temporários do GDAL (`CPL_TMPDIR`) e do Django. Uploads grandes vão para esse
-tmpfs (`FILE_UPLOAD_TEMP_DIR`), então ele precisa de tamanho compatível com o maior upload. Se a memória for um
-limite, aponte `FILE_UPLOAD_TEMP_DIR` para um volume.
+O `/tmp` gravável já vem da instalação padrão: o compose do GeoNode monta o volume nomeado `tmp` em `/tmp` no
+django, no celery e no geoserver. Não é preciso tmpfs. Esse volume compartilhado tem algumas consequências:
+
+- **Permissão**: na primeira montagem, o Docker e o podman copiam para o volume o `/tmp` da imagem, com modo `1777`.
+  Qualquer UID grava nele. Um volume criado antes, por outra imagem, mantém as permissões que já tinha.
+- **Mesmo UID em todos os serviços**: por causa do sticky bit, um UID não apaga arquivos de outro. Use o mesmo
+  `user:` no django e no celery.
+- **`HOME=/tmp` compartilhado**: com o nss_wrapper, o django e o celery passam a ter o mesmo `HOME`, e o
+  `$HOME/.override_env` que o `tasks.py` grava no entrypoint vira um arquivo só. Como root, cada container tinha o seu
+  em `/root`. O conteúdo vem do mesmo `.env`, então isso só muda algo se os serviços tiverem variáveis diferentes.
+  Nesse caso, defina `HOME` para um diretório próprio em cada serviço, dentro de um volume.
+- **nss_wrapper**: os arquivos virtuais ficam num diretório exclusivo, criado com `mktemp -d`, então os containers
+  não colidem nem leem arquivos plantados por outro.
+- **Tamanho**: uploads (`FILE_UPLOAD_TEMP_DIR` não é definido no GeoNode, então o Django usa o `/tmp`), os
+  `mkdtemp()` do importer (`geonode/storage/data_retriever.py`) e os temporários do GDAL ficam no disco do volume,
+  e não na memória.
+
+Sem esse volume, por exemplo no Kubernetes, use um `emptyDir` (ou `--tmpfs /tmp`, como no teste acima). Ele precisa
+ter espaço para o maior upload.
 
 ## Compatibilidade do cliente PostgreSQL
 
