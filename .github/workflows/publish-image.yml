@@ -53,11 +53,42 @@ jobs:
               esac
           done
 
+  # Tag: <GDAL_VERSION>-py<PYTHON_VERSION>, as the tags of ndscprm/gdal, from the ARG defaults in the
+  # Dockerfile. The reusable workflow replaces {version} (ARG GDAL_VERSION); the Python version is put in
+  # the tag here
+  meta:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      variants: ${{ steps.variants.outputs.variants }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Variants
+        id: variants
+        run: |
+          PYTHON_VERSION=$(sed -nE 's/^ARG PYTHON_VERSION=([0-9]+\.[0-9]+)$/\1/p' Dockerfile)
+          if [ -z "$PYTHON_VERSION" ]; then
+              echo "::error::no line ARG PYTHON_VERSION=X.Y in the Dockerfile"
+              exit 1
+          fi
+          # the smoke test checks that the image has the GDAL and Python versions of the Dockerfile
+          variants=$(jq -cn --arg py "$PYTHON_VERSION" '[
+            {name: "release", target: "release", tag: "{version}-py\($py)", scan: true,
+             test: "sh .github/scripts/smoke-test.sh \"$IMAGE_REF\""}
+          ]')
+          echo "variants=${variants}" >> "$GITHUB_OUTPUT"
+          jq . <<< "$variants"
+
   # build, test, scan and tags in the reusable workflow of the base image (README
   # of gdal-oci, "Workflow reutilizável"): native runners per architecture, push
   # by digest, tags only after the tests and scans of both architectures
   image:
-    needs: check
+    needs: [check, meta]
     uses: nds-cprm/gdal-oci/.github/workflows/reusable-publish-image.yml@main
     permissions:
       contents: read
@@ -68,9 +99,8 @@ jobs:
       DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
     with:
       image: docker.io/ndscprm/geonode-base
-      # the Dockerfile (ARG GEONODE_VERSION) is the single source of the
-      # GeoNode version this base is made for, and of the image tag
-      version-arg: GEONODE_VERSION
+      # the Dockerfile (ARG GDAL_VERSION and ARG PYTHON_VERSION) is the single source of the image tag
+      version-arg: GDAL_VERSION
       # base images given by gdal-oci when it starts this workflow (the images it has just published);
       # empty lines are ignored, so without them the ARG defaults of the Dockerfile are built.
       # image_nopy is accepted and ignored: this image needs Python
@@ -78,8 +108,4 @@ jobs:
         ${{ inputs.image_devel && format('GDAL_IMAGE_DEVEL={0}', inputs.image_devel) || '' }}
         ${{ inputs.image_py && format('GDAL_IMAGE_PY={0}', inputs.image_py) || '' }}
       # the OCI labels come from the Dockerfile; created, revision and source from the reusable workflow
-      variants: |
-        [
-          {"name": "release", "target": "release", "tag": "{version}", "scan": true,
-           "test": "sh .github/scripts/smoke-test.sh \"$IMAGE_REF\""}
-        ]
+      variants: ${{ needs.meta.outputs.variants }}

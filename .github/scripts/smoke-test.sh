@@ -5,7 +5,8 @@
 # run in production (arbitrary UID, read-only root filesystem with a writable /tmp) and checks the nss_wrapper
 # of the base, the Python environment GeoNode builds on (GDAL bindings, numpy, psycopg2, uWSGI, invoke),
 # libmagic, the PostgreSQL client, the hardening (no setuid/setgid files, no compiler) and that only /tmp is
-# writable.
+# writable. The GDAL and Python versions must be those of the ARGs of the Dockerfile, which make the image tag:
+# the CI builds on the base images gdal-oci passes, so a new GDAL or Python there fails here, before any tag.
 set -eu
 
 IMAGE=${1:?usage: $0 <image>}
@@ -16,6 +17,12 @@ fail() {
     exit 1
 }
 
+DOCKERFILE=$(dirname "$0")/../../Dockerfile
+GDAL_VERSION=$(sed -nE 's/^ARG GDAL_VERSION=([0-9]+\.[0-9]+\.[0-9]+)$/\1/p' "$DOCKERFILE")
+PYTHON_VERSION=$(sed -nE 's/^ARG PYTHON_VERSION=([0-9]+\.[0-9]+)$/\1/p' "$DOCKERFILE")
+[ -n "$GDAL_VERSION" ] && [ -n "$PYTHON_VERSION" ] \
+    || fail "no lines ARG GDAL_VERSION=X.Y.Z and ARG PYTHON_VERSION=X.Y in $DOCKERFILE"
+
 # no USER on purpose: the GeoNode Dockerfile still runs apt-get after FROM, and sets the USER of the final image
 echo "## image configuration"
 [ -z "$("$DOCKER" image inspect "$IMAGE" --format '{{.Config.User}}')" ] || fail "the base image must not set USER"
@@ -23,6 +30,9 @@ echo "## image configuration"
     || fail "WORKDIR is not /usr/src/geonode"
 [ "$("$DOCKER" image inspect "$IMAGE" --format '{{join .Config.Entrypoint " "}}')" = /docker-entrypoint.sh ] \
     || fail "ENTRYPOINT is not the /docker-entrypoint.sh of the base image"
+version=$("$DOCKER" image inspect "$IMAGE" --format '{{index .Config.Labels "org.opencontainers.image.version"}}')
+[ "$version" = "${GDAL_VERSION}-py${PYTHON_VERSION}" ] \
+    || fail "label org.opencontainers.image.version is '$version', not ${GDAL_VERSION}-py${PYTHON_VERSION}"
 
 # Podman adds the UID to /etc/passwd by default, so the nss_wrapper of the base image would not be used;
 # --passwd=false keeps the passwd of the image, as Docker and OpenShift do.
@@ -37,7 +47,8 @@ fi
 echo "## container (--user 12345:0, --read-only, --tmpfs /tmp)"
 # shellcheck disable=SC2086
 "$DOCKER" run --rm -i --user 12345:0 --read-only --tmpfs "/tmp$TMPFS_OPTS" --cap-drop ALL \
-    --security-opt no-new-privileges $RUN_ARGS -e ENTRYPOINT_QUIET_LOGS=1 "$IMAGE" bash -s << 'EOF' \
+    --security-opt no-new-privileges $RUN_ARGS -e ENTRYPOINT_QUIET_LOGS=1 \
+    -e EXPECTED_GDAL="$GDAL_VERSION" -e EXPECTED_PYTHON="$PYTHON_VERSION" "$IMAGE" bash -s << 'EOF' \
     || fail "container checks"
 set -euo pipefail
 
@@ -64,6 +75,7 @@ python - << 'PY'
 import ctypes
 import ctypes.util
 import importlib.util
+import os
 import sys
 
 import numpy
@@ -78,6 +90,16 @@ def error(message):
     print(message, file=sys.stderr)
     failed = True
 
+
+# the versions of the tag (ARGs of the Dockerfile)
+expected_gdal = os.environ['EXPECTED_GDAL']
+expected_python = os.environ['EXPECTED_PYTHON']
+python = f'{sys.version_info.major}.{sys.version_info.minor}'
+print('Python', sys.version.split()[0], '/ expected', expected_python, '| GDAL expected', expected_gdal)
+if python != expected_python:
+    error(f'Python {python} is not the PYTHON_VERSION of the Dockerfile ({expected_python})')
+if gdal.VersionInfo('RELEASE_NAME') != expected_gdal:
+    error(f"GDAL {gdal.VersionInfo('RELEASE_NAME')} is not the GDAL_VERSION of the Dockerfile ({expected_gdal})")
 
 print('GDAL', gdal.__version__, '/ lib', gdal.VersionInfo('RELEASE_NAME'), '/ numpy', numpy.__version__)
 if gdal.__version__ != gdal.VersionInfo('RELEASE_NAME'):

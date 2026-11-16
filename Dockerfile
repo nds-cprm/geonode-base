@@ -11,15 +11,22 @@
 #   - multi-stage: packages that need a compiler are built as wheels on the GDAL devel image
 #     (same Debian, Python and /opt/geosgb layout), so the final image has no compilers or headers
 
-# base images: ndscprm/gdal (Debian trixie + official Python + GDAL in /opt/geosgb), by full name. The defaults
-# are the moving tags, rebuilt in place every week, for local builds; the CI passes the exact images the CI of
-# gdal-oci has just published (dated tag and digest: <tag>-<YYYYMMDD>@sha256:...), all of the same build of the base
-ARG GDAL_IMAGE_DEVEL=docker.io/ndscprm/gdal:3.12.4-py3.12-devel
-ARG GDAL_IMAGE_PY=docker.io/ndscprm/gdal:3.12.4-py3.12
+# GDAL and Python versions of the ndscprm/gdal base, and the image tag: <GDAL_VERSION>-py<PYTHON_VERSION>, as the
+# tags of the base. Read by the CI workflow and by the smoke test, which fails if the image has other versions
+# (e.g. gdal-oci moved to a new GDAL): keep the format "ARG GDAL_VERSION=X.Y.Z" and "ARG PYTHON_VERSION=X.Y".
+# Derived GeoNode images pin "GDAL==<GDAL_VERSION>" in pyproject.toml (no compiler here to build another one)
+ARG GDAL_VERSION=3.12.4
+ARG PYTHON_VERSION=3.12
+# the tag, for the version label (derived from the two above; do not set it). PYTHON_VERSION cannot be read inside
+# a stage: the ENV PYTHON_VERSION of the python image (full version, e.g. 3.12.16) overrides the ARG there
+ARG IMAGE_VERSION=${GDAL_VERSION}-py${PYTHON_VERSION}
 
-# GeoNode version this base is made for (the Python pins below follow its pyproject.toml); it is the image tag,
-# read by the CI workflow (keep this format: ARG GEONODE_VERSION=X.Y.Z)
-ARG GEONODE_VERSION=5.2.0
+# base images: ndscprm/gdal (Debian trixie + official Python + GDAL in /opt/geosgb), by full name. The defaults
+# are the moving tags of the versions above, rebuilt in place every week, for local builds; the CI passes the
+# exact images the CI of gdal-oci has just published (dated tag and digest: <tag>-<YYYYMMDD>@sha256:...), all of
+# the same build of the base
+ARG GDAL_IMAGE_DEVEL=docker.io/ndscprm/gdal:${GDAL_VERSION}-py${PYTHON_VERSION}-devel
+ARG GDAL_IMAGE_PY=docker.io/ndscprm/gdal:${GDAL_VERSION}-py${PYTHON_VERSION}
 
 # Python packages of the upstream base, plus psycopg2 (GeoNode requirement that needs libpq to build).
 # Keep UWSGI_VERSION and PSYCOPG2_VERSION equal to GeoNode's pyproject.toml pins: if they differ, pip tries
@@ -159,12 +166,12 @@ COPY LICENSE /usr/share/doc/geonode-base/
 
 # the base this image was built on: its tags (<version>, and the dated one) do not say
 ARG GDAL_IMAGE_PY
-ARG GEONODE_VERSION
+ARG IMAGE_VERSION
 # every key, or the labels of the ndscprm/gdal base would show through; created and revision are set by the CI,
 # for each build
 LABEL org.opencontainers.image.title="GeoNode base" \
       org.opencontainers.image.description="Imagem base do GeoNode para instâncias do SGB, sobre GDAL e Python" \
-      org.opencontainers.image.version="${GEONODE_VERSION}" \
+      org.opencontainers.image.version="${IMAGE_VERSION}" \
       org.opencontainers.image.vendor="SGB/CPRM" \
       org.opencontainers.image.authors="Carlos Eduardo Mota <carlos.mota@sgb.gov.br>" \
       org.opencontainers.image.licenses="GPL-3.0" \

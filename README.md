@@ -26,9 +26,10 @@ Argumentos:
 
 | Argumento          | Padrão                   | Uso                                                              |
 |--------------------|--------------------------|------------------------------------------------------------------|
-| `GDAL_IMAGE_DEVEL` | `docker.io/ndscprm/gdal:3.12.4-py3.12-devel` | imagem do estágio `build`, pelo nome completo |
-| `GDAL_IMAGE_PY`    | `docker.io/ndscprm/gdal:3.12.4-py3.12` | imagem do estágio `release`, pelo nome completo. Vai para o label `org.opencontainers.image.base.name` |
-| `GEONODE_VERSION`  | `5.2.0`                  | versão do GeoNode para a qual a base é feita. É a tag da imagem e o label `org.opencontainers.image.version` |
+| `GDAL_VERSION`     | `3.12.4`                 | versão do GDAL da base. Forma a tag (`<GDAL_VERSION>-py<PYTHON_VERSION>`) e os padrões das duas imagens abaixo |
+| `PYTHON_VERSION`   | `3.12`                   | versão do Python da base, só `X.Y` |
+| `GDAL_IMAGE_DEVEL` | `docker.io/ndscprm/gdal:${GDAL_VERSION}-py${PYTHON_VERSION}-devel` | imagem do estágio `build`, pelo nome completo |
+| `GDAL_IMAGE_PY`    | `docker.io/ndscprm/gdal:${GDAL_VERSION}-py${PYTHON_VERSION}` | imagem do estágio `release`, pelo nome completo. Vai para o label `org.opencontainers.image.base.name` |
 | `UWSGI_VERSION`    | `2.0.30`                 | uWSGI, igual ao pin do GeoNode                                   |
 | `PSYCOPG2_VERSION` | `2.9.13`                 | psycopg2, igual ao pin do GeoNode                                |
 | `INVOKE_VERSION`   | `2.2.0`                  | invoke                                                           |
@@ -52,10 +53,16 @@ Uma falha no teste ou na análise impede a criação das tags. As vulnerabilidad
 
 | Tag | Exemplo | Conteúdo |
 |---|---|---|
-| `<versão do GeoNode>` | `5.2.0` | **Móvel**: republicada a cada rebuild da imagem base, com as correções de segurança. Recomendada no `FROM` |
-| `<versão>-<AAAAMMDD>` | `5.2.0-20261116` | Um build específico (data UTC; `.2`, `.3`... nos builds seguintes do mesmo dia). Nunca é sobrescrita: use-a, de preferência com o digest, para fixar a imagem ou voltar a uma anterior |
+| `<GDAL>-py<Python>` | `3.12.4-py3.12` | **Móvel**: republicada a cada rebuild da imagem base, com as correções de segurança. Recomendada no `FROM` |
+| `<GDAL>-py<Python>-<AAAAMMDD>` | `3.12.4-py3.12-20261116` | Um build específico (data UTC; `.2`, `.3`... nos builds seguintes do mesmo dia). Nunca é sobrescrita: use-a, de preferência com o digest, para fixar a imagem ou voltar a uma anterior |
 
-Não há tag `latest`. A base exata de cada build fica no label `org.opencontainers.image.base.name`.
+Não há tag `latest`. As tags seguem o padrão da `ndscprm/gdal`: a tag `3.12.4-py3.12` desta imagem é construída
+sobre a `ndscprm/gdal:3.12.4-py3.12`. A base exata de cada build fica no label `org.opencontainers.image.base.name`.
+
+A tag não traz a versão do GeoNode porque a base serve para qualquer GeoNode 5.x que fixe os mesmos pacotes. O que
+liga as duas imagens é o GDAL: o GeoNode derivado fixa `GDAL==<versão da tag>` no `pyproject.toml`. Os pins de
+uWSGI, psycopg2 e numpy coincidem do 5.1 ao master. O 5.0 fixa `psycopg2==2.9.12`, e o projeto derivado precisa
+ajustar esse pin (veja [Atenção: versão do GDAL no GeoNode](#atenção-versão-do-gdal-no-geonode)).
 
 **Disparo:**
 
@@ -77,18 +84,28 @@ Não há tag `latest`. A base exata de cada build fica no label `org.opencontain
 
   Sem isso, o build semanal da base não dispara este workflow, e a imagem só é atualizada manualmente.
 
-**Versão.** A tag vem da linha `ARG GEONODE_VERSION=X.Y.Z` do [Dockerfile](Dockerfile), que o workflow lê com
-`sed`. Mantenha esse formato. Ao passar para outra versão do GeoNode:
+**Versão.** A tag vem das linhas `ARG GDAL_VERSION=X.Y.Z` e `ARG PYTHON_VERSION=X.Y` do [Dockerfile](Dockerfile).
+O workflow reutilizável lê a primeira, e o job `meta` lê a segunda. Mantenha esse formato.
 
-1. atualize `GEONODE_VERSION`;
-2. alinhe `UWSGI_VERSION`, `PSYCOPG2_VERSION` e `NUMPY_VERSION` ao `pyproject.toml` daquela versão;
-3. confira o pin do GDAL (veja [Atenção: versão do GDAL no GeoNode](#atenção-versão-do-gdal-no-geonode));
+O CI é construído sobre as imagens que o gdal-oci passa, e o teste de fumaça falha se o GDAL ou o Python da imagem
+não forem os do Dockerfile. Quando o gdal-oci mudar de versão, o build disparado por ele falha sem criar tags, em vez
+de publicar uma tag `3.12.4-py3.12` com outro GDAL. Para acompanhar a mudança:
+
+1. atualize `GDAL_VERSION` e/ou `PYTHON_VERSION`;
+2. atualize o pin `GDAL==` no `pyproject.toml` do GeoNode derivado e o `FROM` dele;
+3. se mudar a versão do GeoNode, alinhe `UWSGI_VERSION`, `PSYCOPG2_VERSION` e `NUMPY_VERSION` ao `pyproject.toml`
+   dela;
 4. faça o commit e dispare o workflow.
+
+`IMAGE_VERSION` é derivado das duas versões e só serve ao label `org.opencontainers.image.version`. Dentro de um
+estágio, o `ENV PYTHON_VERSION` da imagem do Python (versão completa, ex.: `3.12.16`) prevalece sobre o `ARG`.
 
 **Teste de fumaça.** Roda o container como as imagens derivadas rodam em produção:
 `--user 12345:0 --read-only --tmpfs /tmp --cap-drop ALL`. Ele confere:
 
-- a configuração da imagem: sem `USER`, `WORKDIR` e `ENTRYPOINT`;
+- a configuração da imagem: sem `USER`, `WORKDIR`, `ENTRYPOINT` e o label de versão igual a
+  `<GDAL_VERSION>-py<PYTHON_VERSION>` do Dockerfile;
+- o GDAL e o Python da imagem iguais aos `ARG` do Dockerfile;
 - o nss_wrapper (usuário `sgb`, `HOME=/tmp`);
 - `/usr/src/venv`, `invoke` e `uwsgi`;
 - `pip check`;
@@ -500,7 +517,7 @@ O `pyproject.toml` do GeoNode fixa `GDAL==3.12.2`, e a imagem traz os bindings d
 ```
 
 Com isso, o pip considera os bindings da imagem já instalados (`Requirement already satisfied: GDAL==3.12.4`) e
-não compila nada. O pin precisa acompanhar a versão do GDAL de `GDAL_IMAGE_PY`. Ao trocar a imagem, o `pyproject.toml`
+não compila nada. O pin precisa acompanhar o `GDAL_VERSION` da base, que é o início da tag. Ao trocar a base, o `pyproject.toml`
 também precisa mudar.
 
 Para testes rápidos, sem editar o `pyproject.toml`, dá para relaxar o pin no Dockerfile derivado, antes do
