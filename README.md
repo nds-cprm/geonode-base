@@ -227,8 +227,11 @@ django, no celery e no geoserver. Não é preciso tmpfs. Esse volume compartilha
 
 - **Permissão**: na primeira montagem, o Docker e o podman copiam para o volume o `/tmp` da imagem, com modo `1777`.
   Qualquer UID grava nele. Um volume criado antes, por outra imagem, mantém as permissões que já tinha.
-- **Mesmo UID em todos os serviços**: por causa do sticky bit, um UID não apaga arquivos de outro. Use o mesmo
-  `user:` no django e no celery.
+- **UID**: o GeoNode não depende de os serviços terem o mesmo UID. Os arquivos que o django passa para o celery
+  (uploads do importer) não ficam no `/tmp`: vão para diretórios criados em `MEDIA_ROOT`, no volume `statics`, e o
+  GeoNode aplica `FILE_UPLOAD_DIRECTORY_PERMISSIONS` e `FILE_UPLOAD_PERMISSIONS` (`0o777`, em `settings.py`). No
+  `/tmp`, cada serviço só lê o que ele mesmo gravou. Com UIDs diferentes, o sticky bit apenas impede que um apague
+  os arquivos do outro.
 - **`HOME=/tmp` compartilhado**: com o nss_wrapper, o django e o celery passam a ter o mesmo `HOME`, e o
   `$HOME/.override_env` que o `tasks.py` grava no entrypoint vira um arquivo só. Como root, cada container tinha o seu
   em `/root`. O conteúdo vem do mesmo `.env`, então isso só muda algo se os serviços tiverem variáveis diferentes.
@@ -239,8 +242,162 @@ django, no celery e no geoserver. Não é preciso tmpfs. Esse volume compartilha
   `mkdtemp()` do importer (`geonode/storage/data_retriever.py`) e os temporários do GDAL ficam no disco do volume,
   e não na memória.
 
-Sem esse volume, por exemplo no Kubernetes, use um `emptyDir` (ou `--tmpfs /tmp`, como no teste acima). Ele precisa
-ter espaço para o maior upload.
+Sem esse volume, use um `emptyDir` (ou `--tmpfs /tmp`, como no teste acima). Ele precisa ter espaço para o maior
+upload.
+
+### OpenShift
+
+Na execução padrão (SCC `restricted-v2`), o OpenShift ignora o `USER` da imagem e escolhe o UID:
+
+- **UID**: o menor valor da faixa do namespace (anotação `openshift.io/sa.scc.uid-range`), quando o pod não define
+  `runAsUser`. Os pods do mesmo namespace costumam receber o mesmo UID, mas isso não é garantido: muda entre
+  namespaces, entre clusters e quando um pod é admitido por outra SCC. Não conte com ele.
+- **Grupos**: o grupo primário é sempre o `0`, e o `fsGroup` (faixa `openshift.io/sa.scc.supplemental-groups`) entra
+  como grupo suplementar. A permissão deve vir do grupo, não do dono.
+- **nss_wrapper**: o UID não existe no `/etc/passwd`, e o entrypoint cria o usuário virtual `sgb` com `HOME=/tmp`.
+
+O que isso muda em relação ao compose:
+
+| Ponto | No OpenShift |
+|---|---|
+| `/tmp` | `emptyDir` por pod. Volumes `emptyDir` não são compartilhados entre pods, e o GeoNode não precisa disso (veja acima). Também resolve o `HOME=/tmp` compartilhado |
+| `statics` (`MEDIA_ROOT`, `STATIC_ROOT`) | PVC `ReadWriteMany` montado no django e no celery. Em volumes com suporte a `fsGroup`, o kubelet ajusta o grupo e libera escrita para ele. Em NFS, o kubelet não faz esse ajuste: veja [Volumes em NFS](#volumes-em-nfs). Sem sticky bit: o celery apaga os diretórios temporários que o django cria |
+| Arquivos fora do upload (`geonode_init.lock`, `celerybeat-schedule`, `collectstatic`) | criados com o umask padrão (`022`), sem escrita para o grupo. Hoje só um serviço escreve cada um, então funciona. Se outro pod precisar regravá-los com outro UID, use `umask 0002` no entrypoint |
+| `USER 1000:0` no `Dockerfile` | continua útil no Docker e no compose. No OpenShift, ele é substituído pelo UID da faixa |
+
+Teste com dois UIDs diferentes, ambos no grupo `0`, num volume com modo `2775` e grupo `0`:
+
+- **Diretório do importer** (criado com `mkdtemp` e `chmod 0o777`, como faz o GeoNode): o outro UID lê o arquivo e
+  apaga o diretório.
+- **Arquivo comum** (umask `022`, modo `644`): o outro UID não consegue alterá-lo, mas consegue apagá-lo, porque o
+  diretório pai é gravável pelo grupo.
+- **Com o pai em modo `1777`** (sticky bit, como o `/tmp`): o outro UID lê o arquivo, mas não apaga o diretório.
+
+### Volumes em NFS
+
+Com o UID arbitrário do OpenShift, o NFS é o ponto mais sensível, por três motivos:
+
+- **O kubelet não ajusta permissões em NFS.** O `fsGroup` não tem efeito: o dono e o modo dos diretórios são os que
+  estão no servidor.
+- **O grupo `0` não funciona com `root_squash`,** que é o padrão do `exports`. O `nfsd` do Linux troca o UID `0` e
+  também o GID `0` (primário e suplementares) pelo `anongid`. A permissão dada ao grupo `0` no servidor não vale
+  para os pods.
+- **Os UIDs podem mudar** entre namespaces, clusters ou reinstalações, e o NFS guarda o UID numérico de quem criou
+  cada arquivo. Um arquivo criado com o UID antigo pode deixar de ser gravável.
+
+Por isso, cada export do GeoNode mapeia todos os clientes para uma identidade fixa, com `all_squash`. O servidor
+passa a tratar qualquer UID do pod como o mesmo dono, e os problemas de UID diferente, umask e arquivos criados por
+outro pod deixam de existir.
+
+#### Servidor
+
+Uma identidade dedicada, sem login e sem uso em outros exports (os valores são exemplos):
+
+```sh
+groupadd -g 5000 geonode
+useradd -u 5000 -g 5000 -M -s /usr/sbin/nologin geonode
+
+install -d -o 5000 -g 5000 -m 2770 /export/geonode
+for v in statics geoserver-data-dir backup-restore data; do
+    install -d -o 5000 -g 5000 -m 2770 "/export/geonode/$v"
+done
+```
+
+`/etc/exports`, liberado só para a rede dos nós do cluster (ou dos hosts do compose):
+
+```text
+/export/geonode  10.0.0.0/24(rw,sync,no_subtree_check,all_squash,anonuid=5000,anongid=5000)
+```
+
+```sh
+exportfs -ra
+```
+
+| Opção | Por quê |
+|---|---|
+| `all_squash,anonuid=5000,anongid=5000` | todo acesso, qualquer que seja o UID do pod, vira `5000:5000`. Inclui o `chmod` que o GeoNode faz nos uploads, porque o servidor vê o mesmo dono |
+| `sync` | a resposta só volta depois da gravação em disco. Evita perder uploads e o `geonode_init.lock` numa queda do servidor |
+| `no_subtree_check` | padrão recomendado. Evita erros quando arquivos são renomeados com o export em uso |
+| sem `no_root_squash` | com `all_squash`, root também vira `5000`. Um container comprometido não ganha root no servidor |
+| `2770` | só o dono e o grupo acessam. O setgid mantém o grupo nos diretórios novos |
+
+Não exporte esse diretório para outros usos: todo cliente dele tem acesso total aos dados do GeoNode.
+
+#### OpenShift
+
+PV e PVC estáticos, um por volume (o exemplo mostra o `statics`):
+
+```yaml
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: geonode-statics
+spec:
+  capacity:
+    storage: 100Gi
+  accessModes:
+    - ReadWriteMany
+  persistentVolumeReclaimPolicy: Retain
+  mountOptions:
+    - nfsvers=4.1
+    - hard
+  nfs:
+    server: nfs.example.internal
+    path: /export/geonode/statics
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: geonode-statics
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: ""
+  volumeName: geonode-statics
+  resources:
+    requests:
+      storage: 100Gi
+```
+
+- **`ReadWriteMany`**: o django, o celery e o geoserver montam o mesmo volume.
+- **`Retain`**: apagar o PVC não apaga os dados.
+- **`hard`**: numa falha do servidor, a gravação espera em vez de devolver erro de I/O e corromper o arquivo.
+- **NFS 4.1**: o lock fica no próprio protocolo, sem `rpc.statd`.
+
+Nos pods, nada muda na `securityContext`: a SCC `restricted-v2` continua escolhendo o UID, e o `all_squash` resolve
+as permissões no servidor. O `/tmp` continua num `emptyDir`, fora do NFS.
+
+#### Compose
+
+O mesmo export, montado pelo driver `local` do Docker ou do podman:
+
+```yaml
+volumes:
+  statics:
+    driver: local
+    driver_opts:
+      type: nfs
+      o: "addr=nfs.example.internal,nfsvers=4.1,hard,rw"
+      device: ":/export/geonode/statics"
+```
+
+Repita para `geoserver-data-dir`, `backup-restore` e `data`. O volume `tmp` continua local.
+
+#### Alternativa sem `all_squash`
+
+Se o servidor precisar preservar o UID de cada cliente (auditoria, cotas):
+
+1. Use `root_squash`, que é o padrão, e um GID dedicado diferente de `0`. Os diretórios ficam com modo `2770` e esse
+   grupo.
+2. Adicione o GID aos pods com `securityContext.supplementalGroups: [5000]`. A `restricted-v2` aceita qualquer valor
+   em `supplementalGroups`. No compose, use `group_add`.
+3. Coloque `umask 0002` no entrypoint do GeoNode. Senão, diretórios e arquivos criados fora dos uploads (o GeoNode
+   só aplica `0o777` nos uploads) saem sem escrita para o grupo, e outro UID não consegue gravar neles.
+
+Essa alternativa tem mais pontos de falha que o `all_squash`. Use-a só se precisar.
+
+> As duas configurações seguem o comportamento documentado do `nfsd` do Linux ([`exports(5)`](https://man7.org/linux/man-pages/man5/exports.5.html))
+> e do OpenShift. Elas não foram testadas aqui, porque o ambiente local não tem servidor NFS.
 
 ## Compatibilidade do cliente PostgreSQL
 
